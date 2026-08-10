@@ -1,0 +1,369 @@
+# HOME ASSISTANT INSTALL LOCATION
+# Copy this file to /config/packages/aqualogic_configuration_report.yaml.
+# In configuration.yaml, enable packages once:
+#
+# homeassistant:
+#   packages: !include_dir_named packages
+#
+# REQUIRED ENTITY SUBSTITUTIONS
+# Add these keys to /config/secrets.yaml (and replace the example values):
+#
+# aqualogic_display_row_1_sensor: sensor.pool_hayward_aqua_logic_display_row_1
+# aqualogic_display_row_2_sensor: sensor.pool_hayward_aqua_logic_display_row_2
+# aqualogic_menu_button: button.pool_hayward_aqua_logic_menu
+# aqualogic_right_button: button.pool_hayward_aqua_logic_right
+# aqualogic_plus_button: button.pool_hayward_aqua_logic_plus
+# aqualogic_menu_unlock_button: button.pool_hayward_aqua_logic_trigger_menu_unlock_sequence
+#
+# The report is published as a persistent Home Assistant notification with ID
+# "aqualogic_configuration_report". Re-running the scan replaces that report.
+#
+# SAFETY: This scanner is for Aqua Logic firmware where Plus advances through
+# configuration-menu entries without changing their values. It never sends
+# Minus, and it never uses Plus outside the unlocked Configuration Menu.
+
+script:
+  scan_aqualogic_configuration:
+    alias: Scan Aqua Logic configuration
+    description: >
+      Captures the display text of every configuration submenu and entry,
+      without changing configuration values.
+    mode: single
+    sequence:
+      - variables:
+          display_row_1_sensor: !secret aqualogic_display_row_1_sensor
+          display_row_2_sensor: !secret aqualogic_display_row_2_sensor
+          menu_button: !secret aqualogic_menu_button
+          right_button: !secret aqualogic_right_button
+          menu_unlock_button: !secret aqualogic_menu_unlock_button
+
+      - alias: Start a visible scan-status notification
+        action: persistent_notification.create
+        data:
+          notification_id: aqualogic_configuration_report
+          title: Aqua Logic configuration report
+          message: "Configuration scan started. Do not use the Aqua Logic keypad until it finishes."
+
+      # The menu label can wrap at a different character on 16- and 20-column
+      # panels, so test both the spaced rows and their direct join.
+      - alias: Press Menu until a Configuration Menu state is visible
+        repeat:
+          count: 32
+          sequence:
+            - if:
+                - condition: template
+                  value_template: >
+                    {% set first = states(display_row_1_sensor) | trim %}
+                    {% set second = states(display_row_2_sensor) | trim %}
+                    {% set spaced = first ~ ' ' ~ second %}
+                    {% set joined = first ~ second %}
+                    {{ 'Configuration Menu-Locked' not in spaced
+                       and 'Configuration Menu-Locked' not in joined
+                       and 'Configuration Menu-Unlocked' not in spaced
+                       and 'Configuration Menu-Unlocked' not in joined }}
+              then:
+                - action: button.press
+                  target:
+                    entity_id: "{{ menu_button }}"
+                - delay: "00:00:01"
+
+      - alias: Stop safely if no Configuration Menu state was found
+        condition: template
+        value_template: >
+          {% set first = states(display_row_1_sensor) | trim %}
+          {% set second = states(display_row_2_sensor) | trim %}
+          {% set spaced = first ~ ' ' ~ second %}
+          {% set joined = first ~ second %}
+          {{ 'Configuration Menu-Locked' in spaced
+             or 'Configuration Menu-Locked' in joined
+             or 'Configuration Menu-Unlocked' in spaced
+             or 'Configuration Menu-Unlocked' in joined }}
+
+      - alias: Unlock the Configuration Menu only when needed
+        if:
+          - condition: template
+            value_template: >
+              {% set first = states(display_row_1_sensor) | trim %}
+              {% set second = states(display_row_2_sensor) | trim %}
+              {{ 'Configuration Menu-Locked' in (first ~ ' ' ~ second)
+                 or 'Configuration Menu-Locked' in (first ~ second) }}
+        then:
+          - action: button.press
+            target:
+              entity_id: "{{ menu_unlock_button }}"
+
+      # The controller can display Menu-Unlocked for only one update before
+      # showing the first configuration heading. After an unlock request, the
+      # reliable signal is that it is no longer locked.
+      - alias: Wait for the Configuration Menu to leave its locked state
+        wait_template: >
+          {% set first = states(display_row_1_sensor) | trim %}
+          {% set second = states(display_row_2_sensor) | trim %}
+          {{ 'Configuration Menu-Locked' not in (first ~ ' ' ~ second)
+             and 'Configuration Menu-Locked' not in (first ~ second) }}
+        timeout: "00:00:15"
+        continue_on_timeout: false
+
+      # The unlock indication can precede the keypad becoming ready for its
+      # first navigation command. This also stabilises scans launched while
+      # the menu was already unlocked.
+      - alias: Let the unlocked Configuration Menu settle
+        delay: "00:00:03"
+
+      # The report is deliberately a Markdown string: persistent notifications
+      # have no 255-character state limit, unlike an input_text helper.
+      - variables:
+          report: |-
+            ## Aqua Logic configuration snapshot
+
+            Captured: {{ now().strftime('%Y-%m-%d %H:%M:%S') }}
+          menus_seen: []
+          current_submenu: Configuration Menu
+          scan_complete: false
+          last_captured_display: ''
+          standalone_section_started: false
+          max_right_presses: 128
+
+      # Right walks every configuration item. A screen whose second row reads
+      # "+ to view/change" is a submenu heading; its first row names the
+      # submenu, and one Plus press enters its first configuration item.
+      - alias: Walk and capture Configuration Menu entries
+        repeat:
+          until:
+            - condition: template
+              value_template: >
+                {{ scan_complete or repeat.index >= max_right_presses }}
+          sequence:
+            # Capture a complete pair of display rows before sending a key.
+            - alias: Wait for a complete frame before Right
+              wait_template: >
+                {% set line_1 = states(display_row_1_sensor) | trim %}
+                {% set line_2 = states(display_row_2_sensor) | trim %}
+                {{ line_1 | length > 0 and line_2 | length > 0 }}
+              timeout: "00:00:05"
+              continue_on_timeout: true
+            - variables:
+                baseline_frame_received: "{{ wait.completed }}"
+                before_right_display: >
+                  {{ states(display_row_1_sensor) | trim ~ '\n' ~
+                     states(display_row_2_sensor) | trim }}
+                frame_received: false
+            # Ignore a blank blink phase and wait for a changed pair of rows.
+            - if:
+                - condition: template
+                  value_template: "{{ baseline_frame_received }}"
+              then:
+                - action: button.press
+                  target:
+                    entity_id: "{{ right_button }}"
+                - wait_template: >
+                    {% set line_1 = states(display_row_1_sensor) | trim %}
+                    {% set line_2 = states(display_row_2_sensor) | trim %}
+                    {% set display = line_1 ~ '\n' ~ line_2 %}
+                    {{ display != before_right_display
+                       and line_1 | length > 0 and line_2 | length > 0 }}
+                  timeout: "00:00:05"
+                  continue_on_timeout: true
+                - variables:
+                    frame_received: "{{ wait.completed }}"
+              else:
+                - variables:
+                    scan_complete: true
+                    report: >
+                      {{ report ~ '\n\n- No complete display frame before Right; scan stopped safely.' }}
+
+            # A dropped Right is safe to retry because Right only navigates
+            # read-only report screens. This is deliberately not used for
+            # Plus, which could change a configuration value after entry.
+            - if:
+                - condition: template
+                  value_template: "{{ not scan_complete and not frame_received }}"
+              then:
+                - delay: "00:00:02"
+                - variables:
+                    before_retry_right_display: >
+                      {{ states(display_row_1_sensor) | trim ~ '\n' ~
+                         states(display_row_2_sensor) | trim }}
+                - action: button.press
+                  target:
+                    entity_id: "{{ right_button }}"
+                - wait_template: >
+                    {% set line_1 = states(display_row_1_sensor) | trim %}
+                    {% set line_2 = states(display_row_2_sensor) | trim %}
+                    {% set display = line_1 ~ '\n' ~ line_2 %}
+                    {{ display != before_retry_right_display
+                       and line_1 | length > 0 and line_2 | length > 0 }}
+                  timeout: "00:00:10"
+                  continue_on_timeout: true
+                - variables:
+                    frame_received: "{{ wait.completed }}"
+
+            - variables:
+                # The row sensors retain the physical LCD boundary directly.
+                display_name: "{{ states(display_row_1_sensor) | trim }}"
+                display_value: "{{ states(display_row_2_sensor) | trim }}"
+                display_text: >
+                  {{ states(display_row_1_sensor) | trim ~ '\n' ~
+                     states(display_row_2_sensor) | trim }}
+
+            - if:
+                - condition: template
+                  value_template: "{{ not frame_received }}"
+              then:
+                - variables:
+                    scan_complete: true
+                    report: >
+                      {{ report ~ '\n\n- No complete display frame after Right; scan stopped safely.' }}
+
+            # Firmware 2.85 displays this terminal option as
+            # "Reset Config. to Default Press +". Match the stable prefix,
+            # not an exact 16-byte line, and stop before any Plus action.
+            - if:
+                - condition: template
+                  value_template: "{{ 'Reset Config' in display_text }}"
+              then:
+                - variables:
+                    scan_complete: true
+                    report: >
+                      {{ report ~ '\n\n### Reset Config\nNot opened — scan stopped safely.' }}
+                # Return to the normal Default Menu rather than leave the
+                # controller displaying the destructive reset option.
+                - action: button.press
+                  target:
+                    entity_id: "{{ menu_button }}"
+                - delay: "00:00:01"
+
+            - if:
+                - condition: template
+                  value_template: >
+                    {{ not scan_complete
+                       and '+ to view' in display_value }}
+              then:
+                - variables:
+                    menu_name: "{{ display_name }}"
+
+                # Reset Config is the terminal menu. Its Plus action restores
+                # defaults, so it must never be sent by this scanner.
+                - if:
+                    - condition: template
+                      value_template: "{{ menu_name == 'Reset Config' }}"
+                  then:
+                    - variables:
+                        scan_complete: true
+                        report: >
+                          {{ report ~ '\n\n### Reset Config\nNot opened — scan stopped safely.' }}
+                  else:
+                    - if:
+                        - condition: template
+                          value_template: "{{ menu_name in menus_seen }}"
+                      then:
+                        # A repeated menu name means Right has wrapped around
+                        # the configuration-menu list, so the scan is complete.
+                        - variables:
+                            scan_complete: true
+                      else:
+                        - variables:
+                            menus_seen: "{{ menus_seen + [menu_name] }}"
+                            current_submenu: "{{ menu_name }}"
+                            report: >
+                              {{ report ~ '\n\n### ' ~ menu_name ~ '\n' }}
+
+                        # Plus enters the submenu once. Use the secret directly
+                        # here, then wait for the changed display frame before
+                        # reading its first value.
+                        - alias: Wait for a complete frame before Plus
+                          wait_template: >
+                            {% set line_1 = states(display_row_1_sensor) | trim %}
+                            {% set line_2 = states(display_row_2_sensor) | trim %}
+                            {{ line_1 | length > 0 and line_2 | length > 0 }}
+                          timeout: "00:00:05"
+                          continue_on_timeout: true
+                        - variables:
+                            plus_baseline_frame_received: "{{ wait.completed }}"
+                            plus_frame_received: false
+                        - if:
+                            - condition: template
+                              value_template: "{{ plus_baseline_frame_received }}"
+                          then:
+                            # Right can update the screen before the RS-485
+                            # keypad is ready for another command. Leave a
+                            # extended quiet interval before this one safe
+                            # Plus press. Some panels need several complete
+                            # display cycles after a Right press; never retry
+                            # Plus automatically.
+                            - delay: "00:00:04"
+                            - action: button.press
+                              target:
+                                entity_id: !secret aqualogic_plus_button
+                            - wait_template: >
+                                {% set name = states(display_row_1_sensor) | trim %}
+                                {% set value = states(display_row_2_sensor) | trim %}
+                                {{ '+ to view' not in value
+                                   and name | length > 0
+                                   and value | length > 0 }}
+                              timeout: "00:00:15"
+                              continue_on_timeout: true
+                            - variables:
+                                plus_frame_received: "{{ wait.completed }}"
+                        - if:
+                            - condition: template
+                              value_template: "{{ plus_frame_received }}"
+                          then:
+                            - variables:
+                                item_name: "{{ states(display_row_1_sensor) | trim }}"
+                                item_value: "{{ states(display_row_2_sensor) | trim }}"
+                            - variables:
+                                report: >
+                                  {{ report ~ '\n- **' ~ item_name ~
+                                     '**: ' ~ item_value }}
+                          else:
+                            - variables:
+                                scan_complete: true
+                                report: >
+                                  {{ report ~ '\n- No complete configuration value after Plus; scan stopped safely.' }}
+              else:
+                # A normal screen is a configuration item: first row is its
+                # setting name and second row is its current value.
+                - if:
+                    - condition: template
+                      value_template: "{{ not scan_complete }}"
+                  then:
+                    - if:
+                        - condition: template
+                          value_template: >
+                            {{ 'Configuration Menu-Unlocked' not in
+                               (display_name ~ ' ' ~ display_value)
+                               and 'Configuration Menu-Unlocked' not in
+                               (display_name ~ display_value)
+                               and display_text != last_captured_display }}
+                      then:
+                        - variables:
+                            is_standalone_setting: >
+                              {{ display_name == 'Remote Menus' }}
+                            add_standalone_heading: >
+                              {{ display_name == 'Remote Menus'
+                                 and not standalone_section_started }}
+                        - variables:
+                            last_captured_display: "{{ display_text }}"
+                            standalone_section_started: >
+                              {{ standalone_section_started or is_standalone_setting }}
+                            report: >
+                              {{ report ~
+                                 ('\n\n### Additional configuration\n'
+                                  if add_standalone_heading
+                                  else '\n') ~
+                                 '- **' ~ display_name ~
+                                 '**: ' ~ display_value }}
+
+            # Do not issue back-to-back RS-485 commands. The controller needs
+            # a quiet interval after the full display frame before the next key.
+            - delay: "00:00:02"
+
+      - alias: Publish the completed report
+        action: persistent_notification.create
+        data:
+          notification_id: aqualogic_configuration_report
+          title: Aqua Logic configuration report
+          message: >
+            {{ report ~ '\n\nScan complete. Right-press safety limit: ' ~
+               max_right_presses ~ '.' }}

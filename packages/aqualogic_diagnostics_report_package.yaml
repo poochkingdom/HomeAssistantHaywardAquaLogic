@@ -1,0 +1,153 @@
+# HOME ASSISTANT INSTALL LOCATION
+# Copy this file to /config/packages/aqualogic_diagnostics_report.yaml. Enable
+# packages in configuration.yaml with:
+#
+# homeassistant:
+#   packages: !include_dir_named packages
+#
+# REQUIRED ENTITY SUBSTITUTIONS
+# Add these keys to /config/secrets.yaml, replacing the example entity IDs:
+#
+# aqualogic_display_row_1_sensor: sensor.pool_hayward_aqua_logic_display_row_1
+# aqualogic_display_row_2_sensor: sensor.pool_hayward_aqua_logic_display_row_2
+# aqualogic_menu_button: button.pool_hayward_aqua_logic_menu
+# aqualogic_right_button: button.pool_hayward_aqua_logic_right
+
+script:
+  scan_aqualogic_diagnostics:
+    alias: Scan Aqua Logic diagnostics
+    description: Capture each screen in the Aqua Logic Diagnostic Menu.
+    mode: single
+    sequence:
+      - variables:
+          display_row_1_sensor: !secret aqualogic_display_row_1_sensor
+          display_row_2_sensor: !secret aqualogic_display_row_2_sensor
+          menu_button: !secret aqualogic_menu_button
+          right_button: !secret aqualogic_right_button
+          menu_heading: Diagnostic Menu
+          max_menu_presses: 8
+          max_right_presses: 64
+
+      - alias: Find Diagnostic Menu
+        repeat:
+          count: "{{ max_menu_presses }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: >
+                    {% set display = states(display_row_1_sensor) | trim ~ ' ' ~
+                       states(display_row_2_sensor) | trim %}
+                    {{ menu_heading not in display }}
+              then:
+                - action: button.press
+                  target:
+                    entity_id: "{{ menu_button }}"
+                - delay: "00:00:01"
+
+      - alias: Stop if Diagnostic Menu was not found
+        condition: template
+        value_template: >
+          {% set display = states(display_row_1_sensor) | trim ~ ' ' ~
+             states(display_row_2_sensor) | trim %}
+          {{ menu_heading in display }}
+
+      - variables:
+          report: |-
+            ## Aqua Logic diagnostics report
+
+            Captured: {{ now().strftime('%Y-%m-%d %H:%M:%S') }}
+          scan_complete: false
+
+      - alias: Let Diagnostic Menu settle before navigation
+        delay: "00:00:02"
+
+      # The new row sensors preserve each physical LCD line, so labels and
+      # values no longer need to be reconstructed from a 32-character buffer.
+      - alias: Capture diagnostic screens
+        repeat:
+          until:
+            - condition: template
+              value_template: "{{ scan_complete or repeat.index >= max_right_presses }}"
+          sequence:
+            - alias: Wait for a complete diagnostic screen
+              wait_template: >
+                {% set line_1 = states(display_row_1_sensor) | trim %}
+                {% set line_2 = states(display_row_2_sensor) | trim %}
+                {{ menu_heading in (line_1 ~ ' ' ~ line_2)
+                   or (line_1 | length > 0 and line_2 | length > 0) }}
+              timeout: "00:00:05"
+              continue_on_timeout: true
+            - variables:
+                baseline_frame_received: "{{ wait.completed }}"
+                before_right_display: >
+                  {{ states(display_row_1_sensor) | trim ~ '\n' ~
+                     states(display_row_2_sensor) | trim }}
+                frame_received: false
+            - if:
+                - condition: template
+                  value_template: "{{ baseline_frame_received }}"
+              then:
+                - action: button.press
+                  target:
+                    entity_id: "{{ right_button }}"
+                - wait_template: >
+                    {% set line_1 = states(display_row_1_sensor) | trim %}
+                    {% set line_2 = states(display_row_2_sensor) | trim %}
+                    {% set display = line_1 ~ '\n' ~ line_2 %}
+                    {{ display != before_right_display
+                       and (menu_heading in (line_1 ~ ' ' ~ line_2)
+                            or (line_1 | length > 0 and line_2 | length > 0)) }}
+                  timeout: "00:00:10"
+                  continue_on_timeout: true
+                - variables:
+                    frame_received: "{{ wait.completed }}"
+              else:
+                - variables:
+                    scan_complete: true
+                    report: >
+                      {{ report ~ '\n\n- No complete display frame before Right; scan stopped safely.' }}
+            - variables:
+                diagnostic_name: "{{ states(display_row_1_sensor) | trim }}"
+                diagnostic_value: "{{ states(display_row_2_sensor) | trim }}"
+            - variables:
+                diagnostic_report_name: >
+                  {{ 'Display Software' if diagnostic_name == 'Display Software'
+                     else diagnostic_name }}
+                diagnostic_report_value: >
+                  {{ 'Version unavailable (not reported on bus)'
+                     if diagnostic_name == 'Display Software'
+                     else diagnostic_value }}
+            - if:
+                - condition: template
+                  value_template: "{{ not scan_complete and not frame_received }}"
+              then:
+                - variables:
+                    scan_complete: true
+                    report: >
+                      {{ report ~ '\n\n- No complete display frame after Right; scan stopped safely.' }}
+            - if:
+                - condition: template
+                  value_template: >
+                    {{ not scan_complete
+                       and menu_heading in (diagnostic_name ~ ' ' ~ diagnostic_value) }}
+              then:
+                - variables:
+                    scan_complete: true
+              else:
+                - if:
+                    - condition: template
+                      value_template: "{{ not scan_complete }}"
+                  then:
+                    - variables:
+                        report: >
+                          {{ report ~ '\n- **' ~ diagnostic_report_name ~
+                             '**: ' ~ diagnostic_report_value }}
+            - delay: "00:00:02"
+
+      - action: persistent_notification.create
+        data:
+          notification_id: aqualogic_diagnostics_report
+          title: Aqua Logic diagnostics report
+          message: >
+            {{ report ~ '\n\nScan complete. Right-press safety limit: ' ~
+               max_right_presses ~ '.' }}
