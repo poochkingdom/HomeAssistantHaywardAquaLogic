@@ -1,0 +1,191 @@
+# HOME ASSISTANT INSTALL LOCATION
+# Copy this file to /config/packages/aqualogic_timers_report.yaml. Enable
+# packages in configuration.yaml with:
+#
+# homeassistant:
+#   packages: !include_dir_named packages
+#
+# REQUIRED ENTITY SUBSTITUTIONS
+# Add these keys to /config/secrets.yaml, replacing the example entity IDs:
+#
+# aqualogic_display_row_1_sensor: sensor.pool_hayward_aqua_logic_display_row_1
+# aqualogic_display_row_2_sensor: sensor.pool_hayward_aqua_logic_display_row_2
+# aqualogic_menu_button: button.pool_hayward_aqua_logic_menu
+# aqualogic_right_button: button.pool_hayward_aqua_logic_right
+
+script:
+  scan_aqualogic_timers:
+    alias: Scan Aqua Logic timers
+    description: Capture each screen in the Aqua Logic Timers Menu.
+    mode: single
+    sequence:
+      - variables:
+          display_row_1_sensor: !secret aqualogic_display_row_1_sensor
+          display_row_2_sensor: !secret aqualogic_display_row_2_sensor
+          menu_button: !secret aqualogic_menu_button
+          right_button: !secret aqualogic_right_button
+          menu_heading: Timers Menu
+          max_menu_presses: 8
+          max_right_presses: 64
+
+      - alias: Find Timers Menu
+        repeat:
+          count: "{{ max_menu_presses }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: >
+                    {% set display = states(display_row_1_sensor) | trim ~ ' ' ~
+                       states(display_row_2_sensor) | trim %}
+                    {{ menu_heading not in display }}
+              then:
+                - action: button.press
+                  target:
+                    entity_id: "{{ menu_button }}"
+                - delay: "00:00:01"
+
+      - alias: Stop if Timers Menu was not found
+        condition: template
+        value_template: >
+          {% set display = states(display_row_1_sensor) | trim ~ ' ' ~
+             states(display_row_2_sensor) | trim %}
+          {{ menu_heading in display }}
+
+      - variables:
+          report: |-
+            ## Aqua Logic timers report
+
+            Captured: {{ now().strftime('%Y-%m-%d %H:%M:%S') }}
+          scan_complete: false
+          last_captured_timer: ''
+
+      - alias: Let Timers Menu settle before navigation
+        delay: "00:00:02"
+
+      # Scheduled timer labels use an all/weekend/weekday suffix and blink
+      # their editable start/end times independently. Their complete values
+      # may end in A/P (12-hour) or a digit (24-hour).
+      - alias: Capture timer screens
+        repeat:
+          until:
+            - condition: template
+              value_template: "{{ scan_complete or repeat.index >= max_right_presses }}"
+          sequence:
+            - alias: Wait for a complete timer screen
+              wait_template: >
+                {% set name = states(display_row_1_sensor) | trim %}
+                {% set value = states(display_row_2_sensor)
+                   | regex_replace('\\s+', ' ') | trim %}
+                {% set is_scheduled_timer =
+                   name.endswith('-all')
+                   or name.endswith('-wkend')
+                   or name.endswith('-wknd')
+                   or name.endswith('-wkday') %}
+                {% set is_countdown_timer = name.endswith('-CountDn') %}
+                {% set is_super_chlorinate = name == 'Super Chlorinate' %}
+                {% set is_complete_time_range =
+                   ' to ' in value
+                   and value.count(':') >= 2
+                   and value[0:1].isdigit()
+                   and (value[-1:] in ['A', 'P'] or value[-1:].isdigit()) %}
+                {{ menu_heading in (name ~ ' ' ~ value)
+                   or (is_scheduled_timer and is_complete_time_range)
+                   or (is_countdown_timer and value.count(':') == 1 and value | length >= 4)
+                   or (is_super_chlorinate and value.endswith('hours') and value[0:1].isdigit()) }}
+              timeout: "00:00:05"
+              continue_on_timeout: true
+            - variables:
+                baseline_frame_received: "{{ wait.completed }}"
+                before_right_display: >
+                  {{ states(display_row_1_sensor) | trim ~ '\n' ~
+                     (states(display_row_2_sensor)
+                      | regex_replace('\\s+', ' ') | trim) }}
+                frame_received: false
+            - if:
+                - condition: template
+                  value_template: "{{ baseline_frame_received }}"
+              then:
+                - action: button.press
+                  target:
+                    entity_id: "{{ right_button }}"
+                # Scheduled timers use two editable states with the same
+                # complete text. Give the panel time to switch its active
+                # field before checking the row again.
+                - delay: "00:00:01"
+                - wait_template: >
+                    {% set name = states(display_row_1_sensor) | trim %}
+                    {% set value = states(display_row_2_sensor)
+                       | regex_replace('\\s+', ' ') | trim %}
+                    {% set display = name ~ '\n' ~ value %}
+                    {% set is_scheduled_timer =
+                       name.endswith('-all')
+                       or name.endswith('-wkend')
+                       or name.endswith('-wknd')
+                       or name.endswith('-wkday') %}
+                    {% set is_countdown_timer = name.endswith('-CountDn') %}
+                    {% set is_super_chlorinate = name == 'Super Chlorinate' %}
+                    {% set is_complete_time_range =
+                       ' to ' in value
+                       and value.count(':') >= 2
+                       and value[0:1].isdigit()
+                       and (value[-1:] in ['A', 'P'] or value[-1:].isdigit()) %}
+                    {{ (is_scheduled_timer and is_complete_time_range)
+                       or (display != before_right_display
+                           and (menu_heading in (name ~ ' ' ~ value)
+                                or (is_countdown_timer and value.count(':') == 1 and value | length >= 4)
+                                or (is_super_chlorinate and value.endswith('hours') and value[0:1].isdigit()))) }}
+                  timeout: "00:00:10"
+                  continue_on_timeout: true
+                - variables:
+                    frame_received: "{{ wait.completed }}"
+              else:
+                - variables:
+                    scan_complete: true
+                    report: >
+                      {{ report ~ '\n\n- No complete display frame before Right; scan stopped safely.' }}
+            - variables:
+                timer_name: "{{ states(display_row_1_sensor) | trim }}"
+                timer_value: >
+                  {{ states(display_row_2_sensor)
+                     | regex_replace('\\s+', ' ') | trim }}
+                timer_record: >
+                  {{ states(display_row_1_sensor) | trim ~ '\n' ~
+                     (states(display_row_2_sensor)
+                      | regex_replace('\\s+', ' ') | trim) }}
+            - if:
+                - condition: template
+                  value_template: "{{ not scan_complete and not frame_received }}"
+              then:
+                - variables:
+                    scan_complete: true
+                    report: >
+                      {{ report ~ '\n\n- No complete display frame after Right; scan stopped safely.' }}
+            - if:
+                - condition: template
+                  value_template: >
+                    {{ not scan_complete
+                       and menu_heading in (timer_name ~ ' ' ~ timer_value) }}
+              then:
+                - variables:
+                    scan_complete: true
+              else:
+                - if:
+                    - condition: template
+                      value_template: >
+                        {{ not scan_complete and
+                           timer_record != last_captured_timer }}
+                  then:
+                    - variables:
+                        last_captured_timer: "{{ timer_record }}"
+                        report: >
+                          {{ report ~ '\n- **' ~ timer_name ~
+                             '**: ' ~ timer_value }}
+            - delay: "00:00:02"
+
+      - action: persistent_notification.create
+        data:
+          notification_id: aqualogic_timers_report
+          title: Aqua Logic timers report
+          message: >
+            {{ report ~ '\n\nScan complete. Right-press safety limit: ' ~
+               max_right_presses ~ '.' }}
